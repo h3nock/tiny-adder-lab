@@ -56,6 +56,10 @@ TARGET_LEN = SUM_DIGITS + 1  # reversed 11-digit sum + EOS
 MODEL_INPUT_LEN = PROMPT_LEN + SUM_DIGITS  # teacher-forced LM length (33)
 
 POW10_11 = torch.tensor([10**i for i in range(SUM_DIGITS)], dtype=torch.int64)
+POW10_10_DESC = torch.tensor([10 ** (NUM_DIGITS - 1 - i) for i in range(NUM_DIGITS)], dtype=torch.int64)
+MAX_BY_DIGITS = [10**d - 1 for d in range(NUM_DIGITS + 1)]
+DEFAULT_PHASE1_RATIO = 2000.0 / 27000.0
+DEFAULT_PHASE2_RATIO = 7000.0 / 27000.0
 
 
 def set_seed(seed: int) -> None:
@@ -95,9 +99,8 @@ def decode_generated_sum(tokens: list[int]) -> int:
 
 def preprocess_batch(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     bsz = a.shape[0]
-    powers = torch.tensor([10 ** (NUM_DIGITS - 1 - i) for i in range(NUM_DIGITS)], dtype=torch.int64)
-    a_digits = ((a[:, None] // powers[None, :]) % 10).to(torch.long)
-    b_digits = ((b[:, None] // powers[None, :]) % 10).to(torch.long)
+    a_digits = ((a[:, None] // POW10_10_DESC[None, :]) % 10).to(torch.long)
+    b_digits = ((b[:, None] // POW10_10_DESC[None, :]) % 10).to(torch.long)
     plus = torch.full((bsz, 1), TOKENS["+"], dtype=torch.long)
     equals = torch.full((bsz, 1), TOKENS["="], dtype=torch.long)
     return torch.cat([a_digits, plus, b_digits, equals], dim=1)
@@ -309,15 +312,20 @@ class TinyAdderTransformer(nn.Module):
 
     @torch.no_grad()
     def generate(self, idx: torch.Tensor, max_new_tokens: int) -> torch.Tensor:
+        was_training = self.training
         self.eval()
-        out = idx
-        for _ in range(max_new_tokens):
-            if out.shape[1] > self.cfg.max_seq_len:
-                out = out[:, -self.cfg.max_seq_len :]
-            logits, _ = self(out)
-            next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
-            out = torch.cat([out, next_token], dim=1)
-        return out
+        try:
+            out = idx
+            for _ in range(max_new_tokens):
+                if out.shape[1] > self.cfg.max_seq_len:
+                    out = out[:, -self.cfg.max_seq_len :]
+                logits, _ = self(out)
+                next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+                out = torch.cat([out, next_token], dim=1)
+            return out
+        finally:
+            if was_training:
+                self.train()
 
 
 def unique_parameter_count(model: nn.Module) -> int:
@@ -344,6 +352,14 @@ class TrainConfig:
     test_size: int = 10000
     holdout_seed: int = 2025
     ckpt_out: str = "best.pt"
+    last_ckpt_out: str = ""
+    resume: str = ""
+    finetune: str = ""
+    curriculum_mode: str = "absolute"  # absolute, percent, none
+    phase1_end: int = 2000
+    phase2_end: int = 7000
+    phase1_ratio: float = DEFAULT_PHASE1_RATIO
+    phase2_ratio: float = DEFAULT_PHASE2_RATIO
 
 
 def build_holdout(
@@ -370,14 +386,48 @@ def build_holdout(
     return val_a, val_b, test_a, test_b
 
 
-class CurriculumSampler:
-    # (min_digits, max_digits, step_end)
-    phases = [(1, 3, 2000), (1, 6, 7000), (1, 10, 10**18)]
+def resolve_curriculum_phases(cfg: TrainConfig) -> list[tuple[int, int, int]]:
+    mode = cfg.curriculum_mode.strip().lower()
+    if mode == "none":
+        return [(1, 10, 10**18)]
+    if mode == "absolute":
+        p1 = max(1, int(cfg.phase1_end))
+        p2 = int(cfg.phase2_end)
+        if p2 <= p1:
+            raise ValueError(
+                f"Invalid absolute curriculum boundaries: phase2_end ({p2}) must be > phase1_end ({p1})."
+            )
+        return [(1, 3, p1), (1, 6, p2), (1, 10, 10**18)]
+    if mode == "percent":
+        r1 = float(cfg.phase1_ratio)
+        r2 = float(cfg.phase2_ratio)
+        if r2 <= r1:
+            raise ValueError(
+                f"Invalid percent curriculum boundaries: phase2_ratio ({r2}) must be > phase1_ratio ({r1})."
+            )
+        p1 = max(1, int(round(cfg.steps * r1)))
+        p2 = int(round(cfg.steps * r2))
+        if p2 <= p1:
+            raise ValueError(
+                f"Invalid percent curriculum step boundaries after rounding: phase1_end ({p1}), phase2_end ({p2}). "
+                "Increase phase2_ratio or steps."
+            )
+        return [(1, 3, p1), (1, 6, p2), (1, 10, 10**18)]
+    raise ValueError(f"Unsupported curriculum_mode: {cfg.curriculum_mode!r}")
 
-    def __init__(self, batch_size: int, seed: int, reserved_pairs: set[int]):
+
+class CurriculumSampler:
+    def __init__(
+        self,
+        batch_size: int,
+        seed: int,
+        reserved_pairs: set[int],
+        phases: list[tuple[int, int, int]],
+    ):
         self.batch_size = batch_size
         self.rng = random.Random(seed)
         self.reserved = reserved_pairs
+        self.phases = phases
 
     def _range_for_step(self, step: int) -> tuple[int, int]:
         for lo, hi, stop in self.phases:
@@ -385,17 +435,27 @@ class CurriculumSampler:
                 return lo, hi
         return 1, 10
 
+    def state_dict(self) -> dict[str, Any]:
+        return {"rng_state": self.rng.getstate(), "phases": list(self.phases)}
+
+    def load_state_dict(self, blob: dict[str, Any]) -> None:
+        rng_state = blob.get("rng_state")
+        if rng_state is not None:
+            self.rng.setstate(rng_state)
+
     def sample(self, step: int) -> tuple[torch.Tensor, torch.Tensor]:
         lo, hi = self._range_for_step(step)
         a = torch.zeros(self.batch_size, dtype=torch.int64)
         b = torch.zeros(self.batch_size, dtype=torch.int64)
+        rng = self.rng
+        reserved = self.reserved
         for i in range(self.batch_size):
             while True:
-                digits = self.rng.randint(lo, hi)
-                max_val = 10**digits - 1
-                ai = self.rng.randint(0, max_val)
-                bi = self.rng.randint(0, max_val)
-                if pair_hash(ai, bi) not in self.reserved:
+                digits = rng.randint(lo, hi)
+                max_val = MAX_BY_DIGITS[digits]
+                ai = rng.randint(0, max_val)
+                bi = rng.randint(0, max_val)
+                if pair_hash(ai, bi) not in reserved:
                     a[i] = ai
                     b[i] = bi
                     break
@@ -409,6 +469,26 @@ def cosine_lr(step: int, total_steps: int, peak_lr: float, warmup_steps: int, mi
     p = min(max(p, 0.0), 1.0)
     c = 0.5 * (1.0 + math.cos(math.pi * p))
     return peak_lr * (min_lr_ratio + (1.0 - min_lr_ratio) * c)
+
+
+def capture_rng_state() -> dict[str, Any]:
+    return {
+        "python": random.getstate(),
+        "torch_cpu": torch.get_rng_state(),
+        "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+
+
+def restore_rng_state(blob: dict[str, Any]) -> None:
+    py = blob.get("python")
+    if py is not None:
+        random.setstate(py)
+    t_cpu = blob.get("torch_cpu")
+    if t_cpu is not None:
+        torch.set_rng_state(t_cpu)
+    t_cuda = blob.get("torch_cuda")
+    if t_cuda is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(t_cuda)
 
 
 @torch.no_grad()
@@ -445,24 +525,34 @@ def save_checkpoint(
     model_cfg: ModelConfig,
     train_cfg: TrainConfig,
     best_val_exact: float,
+    best_step: int,
     step: int,
+    optimizer: Optional[torch.optim.Optimizer] = None,
+    sampler: Optional[CurriculumSampler] = None,
 ) -> None:
     ckpt_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "model_state": model.state_dict(),
-            "model_config": asdict(model_cfg),
-            "train_config": asdict(train_cfg),
-            "best_val_exact": best_val_exact,
-            "step": step,
-            "params": unique_parameter_count(model),
-        },
-        ckpt_path,
-    )
+    payload: dict[str, Any] = {
+        "model_state": model.state_dict(),
+        "model_config": asdict(model_cfg),
+        "train_config": asdict(train_cfg),
+        "best_val_exact": best_val_exact,
+        "best_step": best_step,
+        "step": step,
+        "params": unique_parameter_count(model),
+        "rng_state": capture_rng_state(),
+    }
+    if optimizer is not None:
+        payload["optimizer_state"] = optimizer.state_dict()
+    if sampler is not None:
+        payload["sampler_state"] = sampler.state_dict()
+    torch.save(payload, ckpt_path)
 
 
 def load_checkpoint(ckpt_path: Path, device: torch.device) -> tuple[TinyAdderTransformer, dict]:
-    blob = torch.load(ckpt_path, map_location=device, weights_only=False)
+    try:
+        blob = torch.load(ckpt_path, map_location=device, weights_only=True)
+    except TypeError:
+        blob = torch.load(ckpt_path, map_location=device)
     cfg = ModelConfig(**blob["model_config"])
     model = TinyAdderTransformer(cfg).to(device)
     model.load_state_dict(blob["model_state"])
@@ -475,6 +565,7 @@ def run_train(
 ) -> dict:
     set_seed(train_cfg.seed)
     device = torch.device(train_cfg.device)
+    phases = resolve_curriculum_phases(train_cfg)
 
     val_a, val_b, test_a, test_b = build_holdout(
         train_cfg.val_size, train_cfg.test_size, train_cfg.holdout_seed
@@ -484,18 +575,94 @@ def run_train(
 
     model = TinyAdderTransformer(model_cfg).to(device)
     params = unique_parameter_count(model)
-    print(f"params={params} device={device}")
+    best_ckpt_path = Path(train_cfg.ckpt_out)
+    if train_cfg.last_ckpt_out.strip():
+        last_ckpt_path = Path(train_cfg.last_ckpt_out)
+    else:
+        last_ckpt_path = best_ckpt_path.with_name("last.pt")
+    print(f"params={params} device={device} curriculum={phases}")
     if wandb_run is not None:
         wandb_run.summary["params"] = int(params)
+        wandb_run.summary["curriculum_phases"] = str(phases)
+        wandb_run.summary["best_ckpt"] = str(best_ckpt_path)
+        wandb_run.summary["last_ckpt"] = str(last_ckpt_path)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=train_cfg.lr, weight_decay=train_cfg.weight_decay)
-    sampler = CurriculumSampler(train_cfg.batch_size, train_cfg.seed + 1337, reserved)
+    sampler = CurriculumSampler(train_cfg.batch_size, train_cfg.seed + 1337, reserved, phases)
 
     best_val_exact = -1.0
     best_step = -1
+    start_step = 0
     t0 = time.time()
 
-    for step in range(train_cfg.steps):
+    if train_cfg.resume.strip() and train_cfg.finetune.strip():
+        raise ValueError("Cannot use both --resume and --finetune. Pick one.")
+
+    if train_cfg.resume.strip():
+        resume_path = Path(train_cfg.resume)
+        if not resume_path.exists():
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
+        try:
+            resume_blob = torch.load(resume_path, map_location=device, weights_only=True)
+        except TypeError:
+            resume_blob = torch.load(resume_path, map_location=device)
+        resume_cfg = ModelConfig(**resume_blob["model_config"])
+        if asdict(resume_cfg) != asdict(model_cfg):
+            raise ValueError(
+                "Resume checkpoint architecture does not match current model config. "
+                "Use matching model args when resuming."
+            )
+        model.load_state_dict(resume_blob["model_state"])
+        if resume_blob.get("optimizer_state") is not None:
+            optimizer.load_state_dict(resume_blob["optimizer_state"])
+        if resume_blob.get("sampler_state") is not None:
+            sampler.load_state_dict(resume_blob["sampler_state"])
+        if resume_blob.get("rng_state") is not None:
+            restore_rng_state(resume_blob["rng_state"])
+
+        best_val_exact = float(resume_blob.get("best_val_exact", resume_blob.get("val_exact", -1.0)))
+        best_step = int(resume_blob.get("best_step", resume_blob.get("step", -1)))
+        start_step = int(resume_blob.get("step", -1)) + 1
+        print(
+            f"resumed from {resume_path} at step={start_step} "
+            f"(best_val_exact={best_val_exact:.5f} best_step={best_step})"
+        )
+        if wandb_run is not None:
+            wandb_run.summary["resumed_from"] = str(resume_path)
+
+        if not best_ckpt_path.exists():
+            print(
+                f"warning: {best_ckpt_path} missing while resuming; "
+                "best metrics will be recomputed from the resumed trajectory."
+            )
+            best_val_exact = -1.0
+            best_step = -1
+
+    elif train_cfg.finetune.strip():
+        ft_path = Path(train_cfg.finetune)
+        if not ft_path.exists():
+            raise FileNotFoundError(f"Finetune checkpoint not found: {ft_path}")
+        try:
+            ft_blob = torch.load(ft_path, map_location=device, weights_only=True)
+        except TypeError:
+            ft_blob = torch.load(ft_path, map_location=device)
+        ft_cfg = ModelConfig(**ft_blob["model_config"])
+        if asdict(ft_cfg) != asdict(model_cfg):
+            raise ValueError(
+                "Finetune checkpoint architecture does not match current model config. "
+                "Use matching model args when fine-tuning."
+            )
+        model.load_state_dict(ft_blob["model_state"])
+        print(
+            f"fine-tuning from {ft_path} "
+            f"(fresh optimizer, lr={train_cfg.lr}, steps={train_cfg.steps})"
+        )
+        if wandb_run is not None:
+            wandb_run.summary["finetuned_from"] = str(ft_path)
+
+    last_trained_step = start_step - 1
+    for step in range(start_step, train_cfg.steps):
+        last_trained_step = step
         model.train()
         a, b = sampler.sample(step)
         x, y = encode_batch(a, b)
@@ -534,24 +701,68 @@ def run_train(
                     },
                     step=step,
                 )
-            if val_exact > best_val_exact:
+            improved = val_exact > best_val_exact
+            if improved:
                 best_val_exact = val_exact
                 best_step = step
                 save_checkpoint(
-                    Path(train_cfg.ckpt_out),
+                    best_ckpt_path,
                     model,
                     model_cfg,
                     train_cfg,
                     best_val_exact,
+                    best_step,
                     step,
+                    optimizer=optimizer,
+                    sampler=sampler,
                 )
-                print(f"  saved {train_cfg.ckpt_out}")
+                print(f"  saved best {best_ckpt_path}")
                 if wandb_run is not None:
-                    wandb_run.summary["best_ckpt"] = str(train_cfg.ckpt_out)
+                    wandb_run.summary["best_ckpt"] = str(best_ckpt_path)
                     wandb_run.summary["best_step"] = int(best_step)
                     wandb_run.summary["best_val_exact"] = float(best_val_exact)
+            save_checkpoint(
+                last_ckpt_path,
+                model,
+                model_cfg,
+                train_cfg,
+                best_val_exact,
+                best_step,
+                step,
+                optimizer=optimizer,
+                sampler=sampler,
+            )
 
-    best_model, blob = load_checkpoint(Path(train_cfg.ckpt_out), device)
+    final_step = max(last_trained_step, start_step - 1, 0)
+    save_checkpoint(
+        last_ckpt_path,
+        model,
+        model_cfg,
+        train_cfg,
+        best_val_exact,
+        best_step,
+        final_step,
+        optimizer=optimizer,
+        sampler=sampler,
+    )
+
+    if not best_ckpt_path.exists():
+        val_exact, _ = evaluate_exact(model, val_a, val_b, train_cfg.eval_batch_size, device)
+        best_val_exact = float(val_exact)
+        best_step = int(final_step)
+        save_checkpoint(
+            best_ckpt_path,
+            model,
+            model_cfg,
+            train_cfg,
+            best_val_exact,
+            best_step,
+            final_step,
+            optimizer=optimizer,
+            sampler=sampler,
+        )
+
+    best_model, blob = load_checkpoint(best_ckpt_path, device)
     test_exact, test_tok = evaluate_exact(best_model, test_a, test_b, train_cfg.eval_batch_size, device)
 
     summary = {
@@ -560,7 +771,9 @@ def run_train(
         "best_step": int(best_step),
         "test_exact": float(test_exact),
         "test_token_acc": float(test_tok),
-        "ckpt_out": str(train_cfg.ckpt_out),
+        "ckpt_out": str(best_ckpt_path),
+        "last_ckpt_out": str(last_ckpt_path),
+        "start_step": int(start_step),
     }
     print(f"done: {summary}")
     if wandb_run is not None:
@@ -569,13 +782,27 @@ def run_train(
 
 
 @torch.no_grad()
-def run_eval(ckpt: Path, device_str: str, test_size: int, seed: int, batch_size: int) -> None:
+def run_eval(
+    ckpt: Path,
+    device_str: str,
+    test_size: int,
+    seed: int,
+    batch_size: int,
+    val_size: int,
+) -> None:
     device = torch.device(device_str)
     model, blob = load_checkpoint(ckpt, device)
-    _, _, test_a, test_b = build_holdout(0, test_size, seed)
+    train_blob = blob.get("train_config", {})
+    holdout_seed = int(train_blob.get("holdout_seed", 2025)) if seed < 0 else int(seed)
+    holdout_val_size = int(train_blob.get("val_size", 5000)) if val_size < 0 else int(val_size)
+    holdout_test_size = int(train_blob.get("test_size", 10000)) if test_size < 0 else int(test_size)
+    _, _, test_a, test_b = build_holdout(holdout_val_size, holdout_test_size, holdout_seed)
     exact, tok = evaluate_exact(model, test_a, test_b, batch_size, device)
     print(f"ckpt={ckpt} params={blob.get('params', unique_parameter_count(model))}")
-    print(f"test_exact={exact:.5f} test_tok={tok:.5f} n={test_size} seed={seed}")
+    print(
+        f"test_exact={exact:.5f} test_tok={tok:.5f} n={holdout_test_size} "
+        f"seed={holdout_seed} val_offset={holdout_val_size}"
+    )
 
 
 @torch.no_grad()
@@ -629,6 +856,11 @@ def run_sweep(project: str, entity: str, group: str, device: str, output_root: P
         "warmup_steps": 1350,
         "weight_decay": 0.01,
         "grad_clip": 1.0,
+        "curriculum_mode": "absolute",
+        "phase1_end": 2000,
+        "phase2_end": 7000,
+        "phase1_ratio": DEFAULT_PHASE1_RATIO,
+        "phase2_ratio": DEFAULT_PHASE2_RATIO,
         "eval_interval": 1000,
         "eval_batch_size": 512,
         "val_size": 5000,
@@ -675,6 +907,7 @@ def run_sweep(project: str, entity: str, group: str, device: str, output_root: P
         run_dir = output_root / run.id
         run_dir.mkdir(parents=True, exist_ok=True)
         ckpt_out = run_dir / "best.pt"
+        last_ckpt_out = run_dir / "last.pt"
         train_cfg = TrainConfig(
             seed=int(cfg["seed"]),
             device=device,
@@ -685,12 +918,18 @@ def run_sweep(project: str, entity: str, group: str, device: str, output_root: P
             warmup_steps=int(cfg["warmup_steps"]),
             weight_decay=float(cfg["weight_decay"]),
             grad_clip=float(cfg["grad_clip"]),
+            curriculum_mode=str(cfg.get("curriculum_mode", "absolute")),
+            phase1_end=int(cfg.get("phase1_end", 2000)),
+            phase2_end=int(cfg.get("phase2_end", 7000)),
+            phase1_ratio=float(cfg.get("phase1_ratio", DEFAULT_PHASE1_RATIO)),
+            phase2_ratio=float(cfg.get("phase2_ratio", DEFAULT_PHASE2_RATIO)),
             eval_interval=int(cfg["eval_interval"]),
             eval_batch_size=int(cfg["eval_batch_size"]),
             val_size=int(cfg["val_size"]),
             test_size=int(cfg["test_size"]),
             holdout_seed=int(cfg["holdout_seed"]),
             ckpt_out=str(ckpt_out),
+            last_ckpt_out=str(last_ckpt_out),
         )
         run_train(model_cfg, train_cfg, wandb_run=run)
     finally:
@@ -767,6 +1006,15 @@ def parse_args() -> argparse.Namespace:
     t.add_argument("--test-size", type=int, default=10000)
     t.add_argument("--holdout-seed", type=int, default=2025)
     t.add_argument("--ckpt-out", type=str, default="best.pt")
+    t.add_argument("--last-ckpt-out", type=str, default="")
+    t.add_argument("--resume", type=str, default="")
+    t.add_argument("--finetune", type=str, default="")
+
+    t.add_argument("--curriculum-mode", type=str, default="absolute", choices=["absolute", "percent", "none"])
+    t.add_argument("--phase1-end", type=int, default=2000)
+    t.add_argument("--phase2-end", type=int, default=7000)
+    t.add_argument("--phase1-ratio", type=float, default=DEFAULT_PHASE1_RATIO)
+    t.add_argument("--phase2-ratio", type=float, default=DEFAULT_PHASE2_RATIO)
 
     t.add_argument("--n-layer", type=int, default=1)
     t.add_argument("--d-model", type=int, default=4)
@@ -790,8 +1038,9 @@ def parse_args() -> argparse.Namespace:
     e = sub.add_parser("eval", help="Evaluate checkpoint")
     e.add_argument("--ckpt", type=Path, required=True)
     e.add_argument("--device", type=str, default="cpu")
-    e.add_argument("--test-size", type=int, default=10000)
-    e.add_argument("--seed", type=int, default=2025)
+    e.add_argument("--test-size", type=int, default=-1)
+    e.add_argument("--seed", type=int, default=-1)
+    e.add_argument("--val-size", type=int, default=-1)
     e.add_argument("--batch-size", type=int, default=512)
 
     p = sub.add_parser("predict", help="Predict one sample")
@@ -836,12 +1085,20 @@ def main() -> None:
             warmup_steps=args.warmup_steps,
             weight_decay=args.weight_decay,
             grad_clip=args.grad_clip,
+            curriculum_mode=args.curriculum_mode,
+            phase1_end=args.phase1_end,
+            phase2_end=args.phase2_end,
+            phase1_ratio=args.phase1_ratio,
+            phase2_ratio=args.phase2_ratio,
             eval_interval=args.eval_interval,
             eval_batch_size=args.eval_batch_size,
             val_size=args.val_size,
             test_size=args.test_size,
             holdout_seed=args.holdout_seed,
             ckpt_out=args.ckpt_out,
+            last_ckpt_out=args.last_ckpt_out,
+            resume=args.resume,
+            finetune=args.finetune,
         )
         if args.wandb:
             try:
@@ -863,7 +1120,7 @@ def main() -> None:
         else:
             run_train(model_cfg, train_cfg)
     elif args.cmd == "eval":
-        run_eval(args.ckpt, args.device, args.test_size, args.seed, args.batch_size)
+        run_eval(args.ckpt, args.device, args.test_size, args.seed, args.batch_size, args.val_size)
     elif args.cmd == "predict":
         run_predict(args.ckpt, args.device, args.a, args.b)
     else:
