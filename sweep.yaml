@@ -1,0 +1,77 @@
+program: tiny_adder.py
+name: tiny-adder-sweep
+method: random
+metric:
+  name: best_val_exact
+  goal: maximize
+early_terminate:
+  type: hyperband
+  min_iter: 12000
+
+parameters:
+  seed:
+    values: [3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 34, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97]
+  n_layer:
+    values: [1]
+  d_model:
+    values: [3, 4]
+  n_head:
+    values: [1]
+  d_ff:
+    values: [4, 6, 8, 10]
+  tie_qkv:
+    values: ["shareA_tieKV", "none"]
+  use_rmsnorm:
+    values: [true, false]
+  pos_rank:
+    values: [1, 2, 3]
+  qkv_rank:
+    values: [1, 2, 3]
+  attn_out_rank:
+    values: [1, 2, 3]
+  ffn_rank:
+    values: [1, 2, 3]
+  steps:
+    values: [120000, 200000, 320000]
+  batch_size:
+    values: [256, 384, 512]
+  lr:
+    distribution: log_uniform_values
+    min: 0.001
+    max: 0.02
+  min_lr_ratio:
+    values: [0.01, 0.03, 0.1]
+  warmup_steps:
+    values: [800, 1200, 2000, 3200]
+  weight_decay:
+    values: [0.0, 0.001, 0.003, 0.01]
+  grad_clip:
+    values: [0.5, 1.0, 2.0]
+  eval_interval:
+    values: [1000, 2000, 4000]
+  eval_batch_size:
+    values: [256, 512]
+  val_size:
+    values: [5000]
+  test_size:
+    values: [10000]
+  holdout_seed:
+    values: [2025]
+  max_params:
+    values: [320]
+
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - sweep
+  - --project
+  - tiny-adder-lab
+  - --group
+  - sweep
+  - --device
+  - cuda
+  - --output-root
+  - runs/wandb
+  - --tags
+  - tiny,adder,sweep
