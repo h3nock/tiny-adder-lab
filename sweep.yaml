@@ -64,11 +64,11 @@ parameters:
   holdout_seed:
     values: [2025]
   max_params:
-    values: [512]
+    values: [311]
 
 command:
   - ${env}
-  - ${interpreter}
+  - .venv/bin/python
   - ${program}
   - sweep
   - --project
