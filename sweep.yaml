@@ -1,28 +1,25 @@
 program: tiny_adder.py
-name: tiny-adder-sweep
-method: random
+name: tiny-adder-arch-multiseed
+method: bayes
 metric:
   name: best_val_exact
   goal: maximize
-early_terminate:
-  type: hyperband
-  min_iter: 12000
 
 parameters:
   seed:
-    values: [3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 34, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97]
+    values: [9, 34, 42]
   n_layer:
     values: [1]
   d_model:
-    values: [3, 4]
+    values: [3, 4, 5, 6, 7]
   n_head:
     values: [1]
   d_ff:
-    values: [4, 6, 8, 10]
+    values: [6, 8, 10, 12, 14]
   tie_qkv:
-    values: ["shareA_tieKV", "none"]
+    values: ["shareA_tieKV"]
   use_rmsnorm:
-    values: [true, false]
+    values: [true]
   pos_rank:
     values: [1, 2, 3]
   qkv_rank:
@@ -31,26 +28,32 @@ parameters:
     values: [1, 2, 3]
   ffn_rank:
     values: [1, 2, 3]
+  curriculum_mode:
+    values: ["absolute"]
+  phase1_end:
+    values: [2000, 4000]
+  phase2_end:
+    values: [7000, 14000]
   steps:
-    values: [120000, 200000, 320000]
+    values: [256000, 512000]
   batch_size:
-    values: [256, 384, 512]
+    values: [512]
   lr:
     distribution: log_uniform_values
-    min: 0.001
-    max: 0.02
+    min: 0.01
+    max: 0.03
   min_lr_ratio:
-    values: [0.01, 0.03, 0.1]
+    values: [0.1]
   warmup_steps:
-    values: [800, 1200, 2000, 3200]
+    values: [1350]
   weight_decay:
-    values: [0.0, 0.001, 0.003, 0.01]
+    values: [0.01]
   grad_clip:
-    values: [0.5, 1.0, 2.0]
+    values: [1.0]
   eval_interval:
-    values: [1000, 2000, 4000]
+    values: [4000]
   eval_batch_size:
-    values: [256, 512]
+    values: [512]
   val_size:
     values: [5000]
   test_size:
@@ -58,7 +61,7 @@ parameters:
   holdout_seed:
     values: [2025]
   max_params:
-    values: [320]
+    values: [512]
 
 command:
   - ${env}
@@ -68,10 +71,10 @@ command:
   - --project
   - tiny-adder-lab
   - --group
-  - sweep
+  - arch-multiseed
   - --device
   - cuda
   - --output-root
   - runs/wandb
   - --tags
-  - tiny,adder,sweep
+  - tiny,adder,arch,multiseed
