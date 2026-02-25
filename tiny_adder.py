@@ -525,6 +525,7 @@ def save_checkpoint(
     model_cfg: ModelConfig,
     train_cfg: TrainConfig,
     best_val_exact: float,
+    best_val_token_acc: float,
     best_step: int,
     step: int,
     optimizer: Optional[torch.optim.Optimizer] = None,
@@ -536,6 +537,7 @@ def save_checkpoint(
         "model_config": asdict(model_cfg),
         "train_config": asdict(train_cfg),
         "best_val_exact": best_val_exact,
+        "best_val_token_acc": best_val_token_acc,
         "best_step": best_step,
         "step": step,
         "params": unique_parameter_count(model),
@@ -591,6 +593,7 @@ def run_train(
     sampler = CurriculumSampler(train_cfg.batch_size, train_cfg.seed + 1337, reserved, phases)
 
     best_val_exact = -1.0
+    best_val_token_acc = -1.0
     best_step = -1
     start_step = 0
     t0 = time.time()
@@ -621,11 +624,13 @@ def run_train(
             restore_rng_state(resume_blob["rng_state"])
 
         best_val_exact = float(resume_blob.get("best_val_exact", resume_blob.get("val_exact", -1.0)))
+        best_val_token_acc = float(resume_blob.get("best_val_token_acc", -1.0))
         best_step = int(resume_blob.get("best_step", resume_blob.get("step", -1)))
         start_step = int(resume_blob.get("step", -1)) + 1
         print(
             f"resumed from {resume_path} at step={start_step} "
-            f"(best_val_exact={best_val_exact:.5f} best_step={best_step})"
+            f"(best_val_exact={best_val_exact:.5f} best_val_token_acc={best_val_token_acc:.5f} "
+            f"best_step={best_step})"
         )
         if wandb_run is not None:
             wandb_run.summary["resumed_from"] = str(resume_path)
@@ -636,6 +641,7 @@ def run_train(
                 "best metrics will be recomputed from the resumed trajectory."
             )
             best_val_exact = -1.0
+            best_val_token_acc = -1.0
             best_step = -1
 
     elif train_cfg.finetune.strip():
@@ -688,22 +694,12 @@ def run_train(
                 f"step={step:6d} loss={loss_val:.4f} val_exact={val_exact:.5f} "
                 f"val_tok={val_tok:.5f} lr={lr_now:.3e} t={elapsed:.1f}s"
             )
-            if wandb_run is not None:
-                wandb_run.log(
-                    {
-                        "step": step,
-                        "train_loss": loss_val,
-                        "val_exact": float(val_exact),
-                        "val_token_acc": float(val_tok),
-                        "lr": float(lr_now),
-                        "elapsed_sec": float(elapsed),
-                        "best_val_exact": float(max(best_val_exact, val_exact)),
-                    },
-                    step=step,
-                )
-            improved = val_exact > best_val_exact
+            improved = (val_exact > best_val_exact) or (
+                val_exact == best_val_exact and val_tok > best_val_token_acc
+            )
             if improved:
-                best_val_exact = val_exact
+                best_val_exact = float(val_exact)
+                best_val_token_acc = float(val_tok)
                 best_step = step
                 save_checkpoint(
                     best_ckpt_path,
@@ -711,6 +707,7 @@ def run_train(
                     model_cfg,
                     train_cfg,
                     best_val_exact,
+                    best_val_token_acc,
                     best_step,
                     step,
                     optimizer=optimizer,
@@ -721,12 +718,28 @@ def run_train(
                     wandb_run.summary["best_ckpt"] = str(best_ckpt_path)
                     wandb_run.summary["best_step"] = int(best_step)
                     wandb_run.summary["best_val_exact"] = float(best_val_exact)
+                    wandb_run.summary["best_val_token_acc"] = float(best_val_token_acc)
+            if wandb_run is not None:
+                wandb_run.log(
+                    {
+                        "step": step,
+                        "train_loss": loss_val,
+                        "val_exact": float(val_exact),
+                        "val_token_acc": float(val_tok),
+                        "lr": float(lr_now),
+                        "elapsed_sec": float(elapsed),
+                        "best_val_exact": float(best_val_exact),
+                        "best_val_token_acc": float(best_val_token_acc),
+                    },
+                    step=step,
+                )
             save_checkpoint(
                 last_ckpt_path,
                 model,
                 model_cfg,
                 train_cfg,
                 best_val_exact,
+                best_val_token_acc,
                 best_step,
                 step,
                 optimizer=optimizer,
@@ -740,6 +753,7 @@ def run_train(
         model_cfg,
         train_cfg,
         best_val_exact,
+        best_val_token_acc,
         best_step,
         final_step,
         optimizer=optimizer,
@@ -747,8 +761,9 @@ def run_train(
     )
 
     if not best_ckpt_path.exists():
-        val_exact, _ = evaluate_exact(model, val_a, val_b, train_cfg.eval_batch_size, device)
+        val_exact, val_tok = evaluate_exact(model, val_a, val_b, train_cfg.eval_batch_size, device)
         best_val_exact = float(val_exact)
+        best_val_token_acc = float(val_tok)
         best_step = int(final_step)
         save_checkpoint(
             best_ckpt_path,
@@ -756,6 +771,7 @@ def run_train(
             model_cfg,
             train_cfg,
             best_val_exact,
+            best_val_token_acc,
             best_step,
             final_step,
             optimizer=optimizer,
@@ -768,6 +784,7 @@ def run_train(
     summary = {
         "params": int(blob.get("params", params)),
         "best_val_exact": float(best_val_exact),
+        "best_val_token_acc": float(best_val_token_acc),
         "best_step": int(best_step),
         "test_exact": float(test_exact),
         "test_token_acc": float(test_tok),
