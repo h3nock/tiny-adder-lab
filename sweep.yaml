@@ -1,12 +1,12 @@
 program: tiny_adder.py
-name: tiny-adder-param-cut-focused
+name: tiny-adder-sub512-search
 method: bayes
 metric:
   name: best_val_token_acc
   goal: maximize
 early_terminate:
   type: hyperband
-  min_iter: 30000
+  min_iter: 120000
 
 parameters:
   seed:
@@ -14,19 +14,19 @@ parameters:
   n_layer:
     values: [1]
   d_model:
-    values: [4]
+    values: [4, 5, 6, 7]
   n_head:
     values: [1]
   d_ff:
-    values: [7, 8, 9]
+    values: [8, 10, 12, 14]
   tie_qkv:
     values: ["shareA_tieKV"]
   use_rmsnorm:
     values: [true]
   pos_rank:
-    values: [3]
+    values: [2, 3]
   qkv_rank:
-    values: [3]
+    values: [2, 3]
   attn_out_rank:
     values: [2, 3]
   ffn_rank:
@@ -38,7 +38,7 @@ parameters:
   phase2_end:
     values: [7000]
   steps:
-    values: [162000, 220000]
+    values: [256000, 512000]
   batch_size:
     values: [512]
   lr:
@@ -48,13 +48,13 @@ parameters:
   min_lr_ratio:
     values: [0.08, 0.1]
   warmup_steps:
-    values: [1350, 2000]
+    values: [2000]
   weight_decay:
     values: [0.003, 0.01]
   grad_clip:
     values: [1.0]
   eval_interval:
-    values: [1000]
+    values: [2000]
   eval_batch_size:
     values: [512]
   val_size:
@@ -74,10 +74,10 @@ command:
   - --project
   - tiny-adder-lab
   - --group
-  - param-cut-focused
+  - sub512-search
   - --device
   - cuda
   - --output-root
   - runs/wandb
   - --tags
-  - tiny,adder,param-cut,focused
+  - tiny,adder,sub512,search
