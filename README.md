@@ -69,6 +69,12 @@ python tiny_adder.py train --steps 512000 --curriculum-mode percent \
   --phase1-ratio 0.074074 --phase2-ratio 0.259259
 ```
 
+## Positional Encoding Options
+`tiny_adder.py train` supports:
+- `--pe-kind learned` (default, trainable positional embeddings with `--pos-rank`)
+- `--pe-kind rope` (rotary attention; no learned positional params)
+- `--pe-kind sincos --pe-period 11` (fixed sinusoidal embeddings; no learned positional params)
+
 ## Evaluate
 ```bash
 python tiny_adder.py eval --ckpt best.pt --device cuda
@@ -88,6 +94,10 @@ wandb login
 wandb sweep sweep.yaml
 CUDA_VISIBLE_DEVICES=0 wandb agent <entity>/<project>/<sweep_id>
 ```
+
+Recommended split:
+- `sweep.yaml`: main learned-PE search (fixed `min_lr_ratio=0.1`)
+- `sweep_pe.yaml`: focused PE search (`sincos`/`rope` with period sweep)
 
 ## AdderBoard verify integration
 `tiny_adder.py` exposes `build_model()` and `add(model, a, b)`.
