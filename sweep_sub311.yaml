@@ -1,0 +1,113 @@
+program: tiny_adder.py
+name: tiny-adder-sub311-search
+method: bayes
+metric:
+  name: best_val_token_acc
+  goal: maximize
+early_terminate:
+  type: hyperband
+  min_iter: 120000
+
+# Strategy: sincos/rope PE costs 0 learnable params (excluded by leaderboard
+# rules), freeing ~111 params vs learned PE. We redirect that budget into
+# larger d_ff and/or bigger d_model.
+#
+# Key insight: for d_model=4, rank-3 attn_out costs MORE than full-rank (24 vs
+# 16). And rank-3 MLP only saves for d_ff>=16. The sweep explores both
+# full-rank and low-rank MLP to find the sweet spot.
+#
+# Promising configs (verified against actual model):
+#   308p  d=4 ff=25 qr3/ar1/full  sincos
+#   304p  d=4 ff=26 qr2/ar1/full  sincos
+#   308p  d=4 ff=23 qr3/ar3/full  sincos
+#   300p  d=6 ff=13 qr2/ar1/full  sincos
+#   306p  d=6 ff=12 qr3/ar1/full  sincos
+#   310p  d=5 ff=18 qr2/ar2/full  sincos
+#   268p  d=4 ff=20 qr3/ar3/r3    sincos
+#   196p  d=4 ff=8  qr3/ar3/r3    sincos  (rezabyt equivalent, ultra-small)
+
+parameters:
+  seed:
+    values: [34, 42, 43, 44, 2025]
+  n_layer:
+    values: [1]
+  d_model:
+    values: [4, 5, 6]
+  n_head:
+    values: [1]
+  d_ff:
+    # Wide range: max_params will filter invalid combos.
+    # d=4 full-rank: budget allows d_ff up to ~28
+    # d=5 full-rank: budget allows d_ff up to ~18
+    # d=6 full-rank: budget allows d_ff up to ~13
+    values: [8, 10, 12, 13, 14, 16, 18, 20, 22, 24, 25, 26]
+  pe_kind:
+    values: ["sincos", "rope"]
+  pe_period:
+    values: [10.0, 11.0, 16.5, 22.0, 33.0]
+  tie_qkv:
+    values: ["shareA_tieKV"]
+  use_rmsnorm:
+    values: [true]
+  pos_rank:
+    # Irrelevant for sincos/rope but required by config
+    values: [3]
+  qkv_rank:
+    values: [2, 3]
+  attn_out_rank:
+    # rank=1 is cheapest for d=4 (8p vs 16p full or 24p rank-3)
+    # full-rank (0) at 16p is fine too
+    values: [0, 1, 2, 3]
+  ffn_rank:
+    # 0 = full-rank (best for small d_ff); 2-3 for large d_ff
+    values: [0, 2, 3]
+  curriculum_mode:
+    values: ["absolute"]
+  phase1_end:
+    values: [2000]
+  phase2_end:
+    values: [7000]
+  steps:
+    values: [256000, 512000]
+  batch_size:
+    values: [512]
+  lr:
+    distribution: log_uniform_values
+    min: 0.012
+    max: 0.030
+  min_lr_ratio:
+    values: [0.1]
+  warmup_steps:
+    values: [1350, 2000]
+  weight_decay:
+    values: [0.003, 0.01]
+  grad_clip:
+    values: [1.0]
+  eval_interval:
+    values: [2000]
+  eval_batch_size:
+    values: [512]
+  val_size:
+    values: [5000]
+  test_size:
+    values: [10000]
+  holdout_seed:
+    values: [2025]
+  max_params:
+    values: [310]
+
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - sweep
+  - --project
+  - tiny-adder-lab
+  - --group
+  - sub311-search
+  - --device
+  - cuda
+  - --output-root
+  - runs/wandb
+  - --tags
+  - tiny,adder,sub311,free-pe
