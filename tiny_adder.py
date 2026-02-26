@@ -31,7 +31,7 @@ SUM_DIGITS = 11
 MAX_ADDEND = 10**NUM_DIGITS - 1
 MAX_OPERAND = 10**NUM_DIGITS
 
-# Vocab: 0-9, +, =, <PAD>, <EOS>
+# Vocab: 0-9, +, =, <EOS>
 TOKENS = {
     "0": 0,
     "1": 1,
@@ -45,8 +45,7 @@ TOKENS = {
     "9": 9,
     "+": 10,
     "=": 11,
-    "<PAD>": 12,
-    "<EOS>": 13,
+    "<EOS>": 12,
 }
 VOCAB_SIZE = len(TOKENS)
 EOS_ID = TOKENS["<EOS>"]
@@ -160,6 +159,32 @@ class LowRankEmbedding(nn.Module):
         return F.embedding(idx, self.a) @ self.b
 
 
+class FixedSinCosEmbedding(nn.Module):
+    def __init__(self, max_seq_len: int, embedding_dim: int, period: float):
+        super().__init__()
+        if period <= 0:
+            raise ValueError(f"period must be > 0, got {period}")
+        half = embedding_dim // 2
+        if half <= 0:
+            raise ValueError(f"embedding_dim must be >= 2 for sin/cos PE, got {embedding_dim}")
+
+        positions = torch.arange(max_seq_len, dtype=torch.float32).unsqueeze(1)
+        freq_index = torch.arange(half, dtype=torch.float32)
+        base_omega = (2.0 * math.pi) / period
+        exponents = freq_index / max(1, half)
+        inv_freq = base_omega / torch.pow(10000.0, exponents)
+        angles = positions * inv_freq.unsqueeze(0)
+        pe = torch.zeros(max_seq_len, embedding_dim, dtype=torch.float32)
+        pe[:, 0 : 2 * half : 2] = torch.sin(angles)
+        pe[:, 1 : 2 * half : 2] = torch.cos(angles)
+        if embedding_dim % 2 == 1:
+            pe[:, -1] = 0.0
+        self.register_buffer("table", pe, persistent=False)
+
+    def forward(self, idx: torch.Tensor) -> torch.Tensor:
+        return self.table[idx]
+
+
 @dataclass
 class ModelConfig:
     n_layer: int = 1
@@ -168,6 +193,8 @@ class ModelConfig:
     d_ff: int = 8
     max_seq_len: int = MODEL_INPUT_LEN
     vocab_size: int = VOCAB_SIZE
+    pe_kind: str = "learned"  # learned, rope, sincos
+    pe_period: float = 11.0
     pos_rank: int = 3
     qkv_rank: int = 3
     attn_out_rank: int = 3
@@ -183,6 +210,19 @@ class CausalSelfAttention(nn.Module):
         self.n_head = cfg.n_head
         self.head_dim = cfg.d_model // cfg.n_head
         self.tie_qkv = cfg.tie_qkv
+        self.use_rope = cfg.pe_kind == "rope"
+        if self.use_rope:
+            if cfg.pe_period <= 0:
+                raise ValueError(f"rope requires pe_period > 0, got {cfg.pe_period}")
+            if self.head_dim % 2 != 0:
+                raise ValueError(
+                    f"rope requires even head_dim, got d_model={cfg.d_model}, n_head={cfg.n_head}, head_dim={self.head_dim}"
+                )
+            half = self.head_dim // 2
+            base_omega = (2.0 * math.pi) / float(cfg.pe_period)
+            exponents = torch.arange(half, dtype=torch.float32) / max(1, half)
+            inv_freq = base_omega / torch.pow(10000.0, exponents)
+            self.register_buffer("rope_inv_freq", inv_freq, persistent=False)
 
         if self.tie_qkv == "shareA_tieKV":
             if cfg.qkv_rank <= 0:
@@ -209,6 +249,21 @@ class CausalSelfAttention(nn.Module):
         mask = torch.tril(torch.ones(cfg.max_seq_len, cfg.max_seq_len, dtype=torch.bool))
         self.register_buffer("mask", mask, persistent=False)
 
+    def _apply_rope(self, x: torch.Tensor, seqlen: int) -> torch.Tensor:
+        pos = torch.arange(seqlen, device=x.device, dtype=x.dtype)
+        inv_freq = self.rope_inv_freq.to(device=x.device, dtype=x.dtype)
+        angles = torch.outer(pos, inv_freq)
+        sin = angles.sin().unsqueeze(0).unsqueeze(0)
+        cos = angles.cos().unsqueeze(0).unsqueeze(0)
+        x_even = x[..., 0::2]
+        x_odd = x[..., 1::2]
+        rot_even = x_even * cos - x_odd * sin
+        rot_odd = x_even * sin + x_odd * cos
+        out = torch.empty_like(x)
+        out[..., 0::2] = rot_even
+        out[..., 1::2] = rot_odd
+        return out
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         bsz, seqlen, d_model = x.shape
         if self.tie_qkv == "shareA_tieKV":
@@ -223,6 +278,9 @@ class CausalSelfAttention(nn.Module):
         q = q.view(bsz, seqlen, self.n_head, self.head_dim).transpose(1, 2)
         k = k.view(bsz, seqlen, self.n_head, self.head_dim).transpose(1, 2)
         v = v.view(bsz, seqlen, self.n_head, self.head_dim).transpose(1, 2)
+        if self.use_rope:
+            q = self._apply_rope(q, seqlen)
+            k = self._apply_rope(k, seqlen)
 
         att = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
         att = att.masked_fill(~self.mask[:seqlen, :seqlen], float("-inf"))
@@ -265,11 +323,18 @@ class TinyAdderTransformer(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.token_emb = nn.Embedding(cfg.vocab_size, cfg.d_model)
-        self.pos_emb = (
-            LowRankEmbedding(cfg.max_seq_len, cfg.d_model, cfg.pos_rank)
-            if cfg.pos_rank > 0
-            else nn.Embedding(cfg.max_seq_len, cfg.d_model)
-        )
+        if cfg.pe_kind == "learned":
+            self.pos_emb: Optional[nn.Module] = (
+                LowRankEmbedding(cfg.max_seq_len, cfg.d_model, cfg.pos_rank)
+                if cfg.pos_rank > 0
+                else nn.Embedding(cfg.max_seq_len, cfg.d_model)
+            )
+        elif cfg.pe_kind == "sincos":
+            self.pos_emb = FixedSinCosEmbedding(cfg.max_seq_len, cfg.d_model, cfg.pe_period)
+        elif cfg.pe_kind == "rope":
+            self.pos_emb = None
+        else:
+            raise ValueError(f"Unsupported pe_kind: {cfg.pe_kind!r}")
         self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layer)])
         norm_cls = RMSNorm if cfg.use_rmsnorm else nn.LayerNorm
         self.ln_f = norm_cls(cfg.d_model)
@@ -295,8 +360,10 @@ class TinyAdderTransformer(nn.Module):
         _, seqlen = idx.shape
         if seqlen > self.cfg.max_seq_len:
             raise ValueError(f"Input length {seqlen} exceeds max_seq_len {self.cfg.max_seq_len}")
-        pos = torch.arange(seqlen, device=idx.device).unsqueeze(0)
-        x = self.token_emb(idx) + self.pos_emb(pos)
+        x = self.token_emb(idx)
+        if self.pos_emb is not None:
+            pos = torch.arange(seqlen, device=idx.device).unsqueeze(0)
+            x = x + self.pos_emb(pos)
         for blk in self.blocks:
             x = blk(x)
         x = self.ln_f(x)
@@ -860,6 +927,8 @@ def run_sweep(project: str, entity: str, group: str, device: str, output_root: P
         "d_model": 4,
         "n_head": 1,
         "d_ff": 8,
+        "pe_kind": "learned",
+        "pe_period": 11.0,
         "pos_rank": 3,
         "qkv_rank": 3,
         "attn_out_rank": 3,
@@ -901,6 +970,8 @@ def run_sweep(project: str, entity: str, group: str, device: str, output_root: P
             d_model=int(cfg["d_model"]),
             n_head=int(cfg["n_head"]),
             d_ff=int(cfg["d_ff"]),
+            pe_kind=str(cfg.get("pe_kind", "learned")),
+            pe_period=float(cfg.get("pe_period", 11.0)),
             pos_rank=int(cfg["pos_rank"]),
             qkv_rank=int(cfg["qkv_rank"]),
             attn_out_rank=int(cfg["attn_out_rank"]),
@@ -909,7 +980,13 @@ def run_sweep(project: str, entity: str, group: str, device: str, output_root: P
             use_rmsnorm=_as_bool(cfg["use_rmsnorm"]),
         )
 
-        probe = TinyAdderTransformer(model_cfg)
+        try:
+            probe = TinyAdderTransformer(model_cfg)
+        except ValueError as exc:
+            run.summary["skipped"] = True
+            run.summary["skip_reason"] = f"invalid_config: {exc}"
+            print(run.summary["skip_reason"])
+            return
         params = unique_parameter_count(probe)
         del probe
         run.summary["params"] = int(params)
@@ -1037,6 +1114,8 @@ def parse_args() -> argparse.Namespace:
     t.add_argument("--d-model", type=int, default=4)
     t.add_argument("--n-head", type=int, default=1)
     t.add_argument("--d-ff", type=int, default=8)
+    t.add_argument("--pe-kind", type=str, default="learned", choices=["learned", "rope", "sincos"])
+    t.add_argument("--pe-period", type=float, default=11.0)
     t.add_argument("--pos-rank", type=int, default=3)
     t.add_argument("--qkv-rank", type=int, default=3)
     t.add_argument("--attn-out-rank", type=int, default=3)
@@ -1085,6 +1164,8 @@ def main() -> None:
             d_model=args.d_model,
             n_head=args.n_head,
             d_ff=args.d_ff,
+            pe_kind=args.pe_kind,
+            pe_period=args.pe_period,
             pos_rank=args.pos_rank,
             qkv_rank=args.qkv_rank,
             attn_out_rank=args.attn_out_rank,
