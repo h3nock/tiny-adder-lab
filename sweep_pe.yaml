@@ -1,5 +1,5 @@
 program: tiny_adder.py
-name: tiny-adder-sub512-search
+name: tiny-adder-pe-search
 method: bayes
 metric:
   name: best_val_token_acc
@@ -14,13 +14,15 @@ parameters:
   n_layer:
     values: [1]
   d_model:
-    values: [4, 5, 6, 7]
+    values: [4, 6]
   n_head:
     values: [1]
   d_ff:
     values: [9, 10, 11]
   pe_kind:
-    values: ["learned"]
+    values: ["sincos", "rope"]
+  pe_period:
+    values: [11.0, 22.0, 33.0]
   tie_qkv:
     values: ["shareA_tieKV"]
   use_rmsnorm:
@@ -28,11 +30,11 @@ parameters:
   pos_rank:
     values: [3]
   qkv_rank:
-    values: [2, 3]
+    values: [3]
   attn_out_rank:
-    values: [2, 3]
+    values: [3]
   ffn_rank:
-    values: [2, 3]
+    values: [3]
   curriculum_mode:
     values: ["absolute"]
   phase1_end:
@@ -40,7 +42,7 @@ parameters:
   phase2_end:
     values: [7000]
   steps:
-    values: [256000, 512000]
+    values: [256000]
   batch_size:
     values: [512]
   lr:
@@ -76,10 +78,10 @@ command:
   - --project
   - tiny-adder-lab
   - --group
-  - sub512-search
+  - pe-search
   - --device
   - cuda
   - --output-root
   - runs/wandb
   - --tags
-  - tiny,adder,sub512,search
+  - tiny,adder,sub512,pe-search
