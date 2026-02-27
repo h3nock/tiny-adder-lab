@@ -99,6 +99,37 @@ Recommended split:
 - `sweep.yaml`: main learned-PE search (fixed `min_lr_ratio=0.1`)
 - `sweep_pe.yaml`: focused PE search (`sincos`/`rope` with period sweep)
 
+## 305-parameter reference run
+W&B run: `henokwondimu/tiny-adder-lab/l6voiqpn`
+
+- Params: `305`
+- Best checkpoint step: `386000`
+- Best metrics: `best_val_exact=1.0`, `best_val_token_acc=1.0`
+- Test metrics: `test_exact=0.9998`, `test_token_acc=0.9999818`
+
+This run was trained to `512000` steps.
+The best checkpoint was reached at `386000`.
+For reproducibility, use the full `512000` steps below.
+
+Reproduction config:
+```bash
+python tiny_adder.py train \
+  --device cuda \
+  --seed 43 \
+  --n-layer 1 --d-model 4 --n-head 1 --d-ff 9 \
+  --pe-kind learned --pos-rank 3 \
+  --qkv-rank 3 --attn-out-rank 2 --ffn-rank 3 \
+  --tie-qkv shareA_tieKV --use-rmsnorm \
+  --batch-size 512 --steps 512000 \
+  --lr 0.01808611797410989 --min-lr-ratio 0.1 \
+  --warmup-steps 2000 --weight-decay 0.003 --grad-clip 1 \
+  --curriculum-mode absolute --phase1-end 2000 --phase2-end 7000 \
+  --eval-interval 2000 --eval-batch-size 512 \
+  --val-size 5000 --test-size 10000 --holdout-seed 2025 \
+  --ckpt-out runs/wandb/l6voiqpn/best.pt \
+  --last-ckpt-out runs/wandb/l6voiqpn/last.pt
+```
+
 ## AdderBoard verify integration
 `tiny_adder.py` exposes `build_model()` and `add(model, a, b)`.
 
