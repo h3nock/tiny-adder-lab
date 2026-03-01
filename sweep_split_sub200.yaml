@@ -38,7 +38,7 @@ parameters:
   split_spiral_init:
     values: [true]
   split_pos_kind:
-    values: ["fixed_shared_sincos", "learned_shared"]
+    values: ["fixed_shared_sincos"]
   prompt_order:
     values: ["lsd"]
 
@@ -72,8 +72,8 @@ parameters:
     values: [512]
   lr:
     distribution: log_uniform_values
-    min: 0.0030
-    max: 0.0048
+    min: 0.0040
+    max: 0.0062
   min_lr_ratio:
     values: [0.1]
   warmup_steps:
