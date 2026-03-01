@@ -56,6 +56,7 @@ MODEL_INPUT_LEN = PROMPT_LEN + SUM_DIGITS  # teacher-forced LM length (33)
 
 POW10_11 = torch.tensor([10**i for i in range(SUM_DIGITS)], dtype=torch.int64)
 POW10_10_DESC = torch.tensor([10 ** (NUM_DIGITS - 1 - i) for i in range(NUM_DIGITS)], dtype=torch.int64)
+POW10_10_ASC = torch.tensor([10**i for i in range(NUM_DIGITS)], dtype=torch.int64)
 MAX_BY_DIGITS = [10**d - 1 for d in range(NUM_DIGITS + 1)]
 DEFAULT_PHASE1_RATIO = 2000.0 / 27000.0
 DEFAULT_PHASE2_RATIO = 7000.0 / 27000.0
@@ -71,11 +72,18 @@ def pair_hash(a: int, b: int) -> int:
     return a * MAX_OPERAND + b
 
 
-def preprocess_prompt(a: int, b: int) -> list[int]:
+def preprocess_prompt(a: int, b: int, prompt_order: str = "msd") -> list[int]:
     if not (0 <= a <= MAX_ADDEND and 0 <= b <= MAX_ADDEND):
         raise ValueError(f"a and b must be in [0, {MAX_ADDEND}]")
-    s = f"{a:010d}+{b:010d}="
-    return [TOKENS[ch] for ch in s]
+    order = prompt_order.strip().lower()
+    if order == "msd":
+        s = f"{a:010d}+{b:010d}="
+        return [TOKENS[ch] for ch in s]
+    if order == "lsd":
+        x_digits = [(a // (10**i)) % 10 for i in range(NUM_DIGITS)]
+        y_digits = [(b // (10**i)) % 10 for i in range(NUM_DIGITS)]
+        return x_digits + [TOKENS["+"]] + y_digits + [TOKENS["="]]
+    raise ValueError(f"Unsupported prompt_order: {prompt_order!r}")
 
 
 def decode_generated_sum(tokens: list[int]) -> int:
@@ -96,17 +104,24 @@ def decode_generated_sum(tokens: list[int]) -> int:
     return int("".join(digits)[::-1])
 
 
-def preprocess_batch(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+def preprocess_batch(a: torch.Tensor, b: torch.Tensor, prompt_order: str = "msd") -> torch.Tensor:
     bsz = a.shape[0]
-    a_digits = ((a[:, None] // POW10_10_DESC[None, :]) % 10).to(torch.long)
-    b_digits = ((b[:, None] // POW10_10_DESC[None, :]) % 10).to(torch.long)
+    order = prompt_order.strip().lower()
+    if order == "msd":
+        a_digits = ((a[:, None] // POW10_10_DESC[None, :]) % 10).to(torch.long)
+        b_digits = ((b[:, None] // POW10_10_DESC[None, :]) % 10).to(torch.long)
+    elif order == "lsd":
+        a_digits = ((a[:, None] // POW10_10_ASC[None, :]) % 10).to(torch.long)
+        b_digits = ((b[:, None] // POW10_10_ASC[None, :]) % 10).to(torch.long)
+    else:
+        raise ValueError(f"Unsupported prompt_order: {prompt_order!r}")
     plus = torch.full((bsz, 1), TOKENS["+"], dtype=torch.long)
     equals = torch.full((bsz, 1), TOKENS["="], dtype=torch.long)
     return torch.cat([a_digits, plus, b_digits, equals], dim=1)
 
 
-def encode_batch(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    prompt = preprocess_batch(a, b)
+def encode_batch(a: torch.Tensor, b: torch.Tensor, prompt_order: str = "msd") -> tuple[torch.Tensor, torch.Tensor]:
+    prompt = preprocess_batch(a, b, prompt_order=prompt_order)
     sums = a + b
     rev_digits = ((sums[:, None] // POW10_11[None, :]) % 10).to(torch.long)
     eos = torch.full((a.shape[0], 1), EOS_ID, dtype=torch.long)
@@ -201,6 +216,15 @@ class ModelConfig:
     ffn_rank: int = 3
     tie_qkv: str = "shareA_tieKV"  # "shareA_tieKV" or "none"
     use_rmsnorm: bool = True
+    arch: str = "factorized"  # factorized, split
+    split_tok_dim: int = 3
+    split_pos_dim: int = 3
+    split_n_head: int = 2
+    split_head_dim: int = 3
+    split_tie_qk: bool = False
+    split_ffn_bias: bool = True
+    split_spiral_init: bool = True
+    prompt_order: str = "msd"  # msd, lsd
 
 
 class CausalSelfAttention(nn.Module):
@@ -395,6 +419,240 @@ class TinyAdderTransformer(nn.Module):
                 self.train()
 
 
+class SplitPositionalEmbedding(nn.Module):
+    """Shared XYZ positional table for fixed prompt/result layout."""
+
+    def __init__(self, max_seq_len: int, pos_dim: int):
+        super().__init__()
+        if pos_dim <= 0:
+            raise ValueError(f"split_pos_dim must be > 0, got {pos_dim}")
+        self.pos_dim = pos_dim
+        self.digit_pos = nn.Parameter(torch.empty(NUM_DIGITS, pos_dim))
+        self.carry_pos = nn.Parameter(torch.empty(1, pos_dim))
+        # +, =, fallback
+        self.special_pos = nn.Parameter(torch.empty(3, pos_dim))
+        nn.init.normal_(self.digit_pos, mean=0.0, std=0.02)
+        nn.init.normal_(self.carry_pos, mean=0.0, std=0.02)
+        nn.init.normal_(self.special_pos, mean=0.0, std=0.02)
+
+        sources = []
+        indices = []
+        for p in range(max_seq_len):
+            if p < NUM_DIGITS:
+                sources.append(0)
+                indices.append(p)
+            elif p == NUM_DIGITS:
+                sources.append(2)  # '+'
+                indices.append(0)
+            elif p < (NUM_DIGITS + 1 + NUM_DIGITS):
+                sources.append(0)
+                indices.append(p - (NUM_DIGITS + 1))
+            elif p == (2 * NUM_DIGITS + 1):
+                sources.append(2)  # '='
+                indices.append(1)
+            else:
+                z_idx = p - (2 * NUM_DIGITS + 2)
+                if z_idx < NUM_DIGITS:
+                    sources.append(0)
+                    indices.append(z_idx)
+                elif z_idx == NUM_DIGITS:
+                    sources.append(1)  # carry digit position
+                    indices.append(0)
+                else:
+                    sources.append(2)
+                    indices.append(2)
+        self.register_buffer("sources", torch.tensor(sources, dtype=torch.long), persistent=False)
+        self.register_buffer("indices", torch.tensor(indices, dtype=torch.long), persistent=False)
+
+    def forward(self, seqlen: int) -> torch.Tensor:
+        src = self.sources[:seqlen]
+        idx = self.indices[:seqlen]
+        out = torch.zeros(seqlen, self.pos_dim, device=self.digit_pos.device, dtype=self.digit_pos.dtype)
+        mask_digit = src == 0
+        if mask_digit.any():
+            out[mask_digit] = self.digit_pos[idx[mask_digit]]
+        mask_carry = src == 1
+        if mask_carry.any():
+            out[mask_carry] = self.carry_pos[idx[mask_carry]]
+        mask_special = src == 2
+        if mask_special.any():
+            out[mask_special] = self.special_pos[idx[mask_special]]
+        return out
+
+
+class SplitCausalSelfAttention(nn.Module):
+    """Q/K from positional dims, V from token dims."""
+
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        if cfg.split_n_head <= 0 or cfg.split_head_dim <= 0:
+            raise ValueError(
+                f"split_n_head and split_head_dim must be > 0, got {cfg.split_n_head}, {cfg.split_head_dim}"
+            )
+        self.n_head = cfg.split_n_head
+        self.head_dim = cfg.split_head_dim
+        self.tok_dim = cfg.split_tok_dim
+        self.pos_dim = cfg.split_pos_dim
+        self.out_dim = cfg.d_model
+        self.tied_qk = cfg.split_tie_qk
+        proj_dim = self.n_head * self.head_dim
+
+        self.q_proj = nn.Linear(self.pos_dim, proj_dim, bias=False)
+        self.k_proj = None if self.tied_qk else nn.Linear(self.pos_dim, proj_dim, bias=False)
+        self.v_proj = nn.Linear(self.tok_dim, proj_dim, bias=False)
+        self.out_proj = nn.Linear(proj_dim, self.out_dim, bias=False)
+
+        mask = torch.tril(torch.ones(cfg.max_seq_len, cfg.max_seq_len, dtype=torch.bool))
+        self.register_buffer("mask", mask, persistent=False)
+
+    def forward(self, tok: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+        bsz, seqlen, _ = tok.shape
+        q = self.q_proj(pos).view(bsz, seqlen, self.n_head, self.head_dim).transpose(1, 2)
+        if self.tied_qk:
+            k = self.q_proj(pos).view(bsz, seqlen, self.n_head, self.head_dim).transpose(1, 2)
+        else:
+            k = self.k_proj(pos).view(bsz, seqlen, self.n_head, self.head_dim).transpose(1, 2)
+        v = self.v_proj(tok).view(bsz, seqlen, self.n_head, self.head_dim).transpose(1, 2)
+
+        att = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        att = att.masked_fill(~self.mask[:seqlen, :seqlen], float("-inf"))
+        att = F.softmax(att, dim=-1)
+        y = (att @ v).transpose(1, 2).contiguous().view(bsz, seqlen, self.n_head * self.head_dim)
+        return self.out_proj(y)
+
+
+class SplitMLP(nn.Module):
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        self.up = nn.Linear(cfg.d_model, cfg.d_ff, bias=cfg.split_ffn_bias)
+        self.down = nn.Linear(cfg.d_ff, cfg.d_model, bias=cfg.split_ffn_bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down(F.gelu(self.up(x)))
+
+
+class SplitBlock(nn.Module):
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        norm_cls = RMSNorm if cfg.use_rmsnorm else nn.LayerNorm
+        self.tok_dim = cfg.split_tok_dim
+        self.ln1 = norm_cls(cfg.d_model)
+        self.attn = SplitCausalSelfAttention(cfg)
+        self.ln2 = norm_cls(cfg.d_model)
+        self.mlp = SplitMLP(cfg)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.ln1(x)
+        tok = h[:, :, : self.tok_dim]
+        pos = h[:, :, self.tok_dim :]
+        x = x + self.attn(tok, pos)
+        x = x + self.mlp(self.ln2(x))
+        return x
+
+
+class SplitTinyAdderTransformer(nn.Module):
+    """Split token/position subspaces with tied output projection."""
+
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        if cfg.n_layer <= 0:
+            raise ValueError(f"n_layer must be > 0, got {cfg.n_layer}")
+        if cfg.d_model != cfg.split_tok_dim + cfg.split_pos_dim:
+            raise ValueError(
+                f"split arch requires d_model == split_tok_dim + split_pos_dim, got "
+                f"{cfg.d_model} != {cfg.split_tok_dim} + {cfg.split_pos_dim}"
+            )
+        self.cfg = cfg
+        self.token_emb = nn.Embedding(cfg.vocab_size, cfg.split_tok_dim)
+        self.pos_emb = SplitPositionalEmbedding(cfg.max_seq_len, cfg.split_pos_dim)
+        self.blocks = nn.ModuleList([SplitBlock(cfg) for _ in range(cfg.n_layer)])
+        norm_cls = RMSNorm if cfg.use_rmsnorm else nn.LayerNorm
+        self.ln_f = norm_cls(cfg.d_model)
+        self.head_proj = nn.Linear(cfg.d_model, cfg.split_tok_dim, bias=False)
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.LayerNorm):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
+            elif isinstance(module, RMSNorm):
+                nn.init.ones_(module.weight)
+        nn.init.normal_(self.token_emb.weight, mean=0.0, std=0.02)
+        if not self.cfg.split_spiral_init:
+            return
+        with torch.no_grad():
+            td = self.cfg.split_tok_dim
+            for d in range(min(10, self.cfg.vocab_size)):
+                vec = torch.zeros(td)
+                if td >= 1:
+                    vec[0] = math.cos(2.0 * math.pi * d / 10.0)
+                if td >= 2:
+                    vec[1] = math.sin(2.0 * math.pi * d / 10.0)
+                if td >= 3:
+                    vec[2] = d / 9.0
+                self.token_emb.weight[d] = vec
+            if self.cfg.vocab_size > TOKENS["+"] and td >= 1:
+                self.token_emb.weight[TOKENS["+"]].zero_()
+                self.token_emb.weight[TOKENS["+"]][0] = 2.0
+            if self.cfg.vocab_size > TOKENS["="] and td >= 2:
+                self.token_emb.weight[TOKENS["="]].zero_()
+                self.token_emb.weight[TOKENS["="]][1] = 2.0
+            if self.cfg.vocab_size > EOS_ID:
+                self.token_emb.weight[EOS_ID].zero_()
+                self.token_emb.weight[EOS_ID][0] = -2.0
+
+    def forward(self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None):
+        _, seqlen = idx.shape
+        if seqlen > self.cfg.max_seq_len:
+            raise ValueError(f"Input length {seqlen} exceeds max_seq_len {self.cfg.max_seq_len}")
+        tok = self.token_emb(idx)
+        pos = self.pos_emb(seqlen).unsqueeze(0).expand(tok.shape[0], -1, -1)
+        x = torch.cat([tok, pos], dim=-1)
+        for blk in self.blocks:
+            x = blk(x)
+        x = self.ln_f(x)
+        logits_tok = self.head_proj(x)
+        logits = logits_tok @ self.token_emb.weight.T
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)),
+                targets.reshape(-1),
+                ignore_index=-100,
+            )
+        return logits, loss
+
+    @torch.no_grad()
+    def generate(self, idx: torch.Tensor, max_new_tokens: int) -> torch.Tensor:
+        was_training = self.training
+        self.eval()
+        try:
+            out = idx
+            for _ in range(max_new_tokens):
+                if out.shape[1] > self.cfg.max_seq_len:
+                    out = out[:, -self.cfg.max_seq_len :]
+                logits, _ = self(out)
+                next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+                out = torch.cat([out, next_token], dim=1)
+            return out
+        finally:
+            if was_training:
+                self.train()
+
+
+def build_transformer(cfg: ModelConfig) -> nn.Module:
+    if cfg.arch == "factorized":
+        return TinyAdderTransformer(cfg)
+    if cfg.arch == "split":
+        return SplitTinyAdderTransformer(cfg)
+    raise ValueError(f"Unsupported arch: {cfg.arch!r}")
+
+
 def unique_parameter_count(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters())
 
@@ -560,11 +818,12 @@ def restore_rng_state(blob: dict[str, Any]) -> None:
 
 @torch.no_grad()
 def evaluate_exact(
-    model: TinyAdderTransformer,
+    model: nn.Module,
     a: torch.Tensor,
     b: torch.Tensor,
     batch_size: int,
     device: torch.device,
+    prompt_order: str = "msd",
 ) -> tuple[float, float]:
     model.eval()
     n = int(a.numel())
@@ -575,7 +834,7 @@ def evaluate_exact(
         ed = min(st + batch_size, n)
         aa = a[st:ed]
         bb = b[st:ed]
-        prompt = preprocess_batch(aa, bb).to(device)
+        prompt = preprocess_batch(aa, bb, prompt_order=prompt_order).to(device)
         gen = model.generate(prompt, max_new_tokens=TARGET_LEN)
         pred_digits = gen[:, -TARGET_LEN:-1].to("cpu")  # generated 11 sum digits
         tgt_digits = ((aa + bb)[:, None] // POW10_11[None, :]) % 10
@@ -588,7 +847,7 @@ def evaluate_exact(
 
 def save_checkpoint(
     ckpt_path: Path,
-    model: TinyAdderTransformer,
+    model: nn.Module,
     model_cfg: ModelConfig,
     train_cfg: TrainConfig,
     best_val_exact: float,
@@ -617,13 +876,13 @@ def save_checkpoint(
     torch.save(payload, ckpt_path)
 
 
-def load_checkpoint(ckpt_path: Path, device: torch.device) -> tuple[TinyAdderTransformer, dict]:
+def load_checkpoint(ckpt_path: Path, device: torch.device) -> tuple[nn.Module, dict]:
     try:
         blob = torch.load(ckpt_path, map_location=device, weights_only=True)
     except TypeError:
         blob = torch.load(ckpt_path, map_location=device)
     cfg = ModelConfig(**blob["model_config"])
-    model = TinyAdderTransformer(cfg).to(device)
+    model = build_transformer(cfg).to(device)
     model.load_state_dict(blob["model_state"])
     model.eval()
     return model, blob
@@ -642,7 +901,7 @@ def run_train(
     reserved = {pair_hash(int(x), int(y)) for x, y in zip(val_a.tolist(), val_b.tolist())}
     reserved |= {pair_hash(int(x), int(y)) for x, y in zip(test_a.tolist(), test_b.tolist())}
 
-    model = TinyAdderTransformer(model_cfg).to(device)
+    model = build_transformer(model_cfg).to(device)
     params = unique_parameter_count(model)
     best_ckpt_path = Path(train_cfg.ckpt_out)
     if train_cfg.last_ckpt_out.strip():
@@ -738,7 +997,7 @@ def run_train(
         last_trained_step = step
         model.train()
         a, b = sampler.sample(step)
-        x, y = encode_batch(a, b)
+        x, y = encode_batch(a, b, prompt_order=model_cfg.prompt_order)
         x = x.to(device)
         y = y.to(device)
 
@@ -754,7 +1013,9 @@ def run_train(
         optimizer.step()
 
         if step % train_cfg.eval_interval == 0 or step == train_cfg.steps - 1:
-            val_exact, val_tok = evaluate_exact(model, val_a, val_b, train_cfg.eval_batch_size, device)
+            val_exact, val_tok = evaluate_exact(
+                model, val_a, val_b, train_cfg.eval_batch_size, device, prompt_order=model_cfg.prompt_order
+            )
             elapsed = time.time() - t0
             loss_val = float(loss.item())
             print(
@@ -828,7 +1089,9 @@ def run_train(
     )
 
     if not best_ckpt_path.exists():
-        val_exact, val_tok = evaluate_exact(model, val_a, val_b, train_cfg.eval_batch_size, device)
+        val_exact, val_tok = evaluate_exact(
+            model, val_a, val_b, train_cfg.eval_batch_size, device, prompt_order=model_cfg.prompt_order
+        )
         best_val_exact = float(val_exact)
         best_val_token_acc = float(val_tok)
         best_step = int(final_step)
@@ -846,7 +1109,9 @@ def run_train(
         )
 
     best_model, blob = load_checkpoint(best_ckpt_path, device)
-    test_exact, test_tok = evaluate_exact(best_model, test_a, test_b, train_cfg.eval_batch_size, device)
+    test_exact, test_tok = evaluate_exact(
+        best_model, test_a, test_b, train_cfg.eval_batch_size, device, prompt_order=model_cfg.prompt_order
+    )
 
     summary = {
         "params": int(blob.get("params", params)),
@@ -876,12 +1141,13 @@ def run_eval(
 ) -> None:
     device = torch.device(device_str)
     model, blob = load_checkpoint(ckpt, device)
+    cfg = ModelConfig(**blob["model_config"])
     train_blob = blob.get("train_config", {})
     holdout_seed = int(train_blob.get("holdout_seed", 2025)) if seed < 0 else int(seed)
     holdout_val_size = int(train_blob.get("val_size", 5000)) if val_size < 0 else int(val_size)
     holdout_test_size = int(train_blob.get("test_size", 10000)) if test_size < 0 else int(test_size)
     _, _, test_a, test_b = build_holdout(holdout_val_size, holdout_test_size, holdout_seed)
-    exact, tok = evaluate_exact(model, test_a, test_b, batch_size, device)
+    exact, tok = evaluate_exact(model, test_a, test_b, batch_size, device, prompt_order=cfg.prompt_order)
     print(f"ckpt={ckpt} params={blob.get('params', unique_parameter_count(model))}")
     print(
         f"test_exact={exact:.5f} test_tok={tok:.5f} n={holdout_test_size} "
@@ -892,8 +1158,9 @@ def run_eval(
 @torch.no_grad()
 def run_predict(ckpt: Path, device_str: str, a: int, b: int) -> None:
     device = torch.device(device_str)
-    model, _ = load_checkpoint(ckpt, device)
-    prompt = torch.tensor([preprocess_prompt(a, b)], dtype=torch.long, device=device)
+    model, blob = load_checkpoint(ckpt, device)
+    cfg = ModelConfig(**blob["model_config"])
+    prompt = torch.tensor([preprocess_prompt(a, b, prompt_order=cfg.prompt_order)], dtype=torch.long, device=device)
     gen = model.generate(prompt, max_new_tokens=TARGET_LEN)
     pred = decode_generated_sum(gen[0, -TARGET_LEN:].tolist())
     print(f"{a} + {b} = {pred} (expected {a+b})")
@@ -935,6 +1202,15 @@ def run_sweep(project: str, entity: str, group: str, device: str, output_root: P
         "ffn_rank": 3,
         "tie_qkv": "shareA_tieKV",
         "use_rmsnorm": True,
+        "arch": "factorized",
+        "split_tok_dim": 3,
+        "split_pos_dim": 3,
+        "split_n_head": 2,
+        "split_head_dim": 3,
+        "split_tie_qk": False,
+        "split_ffn_bias": True,
+        "split_spiral_init": True,
+        "prompt_order": "msd",
         "steps": 162000,
         "batch_size": 512,
         "lr": 0.02,
@@ -978,10 +1254,19 @@ def run_sweep(project: str, entity: str, group: str, device: str, output_root: P
             ffn_rank=int(cfg["ffn_rank"]),
             tie_qkv=str(cfg["tie_qkv"]),
             use_rmsnorm=_as_bool(cfg["use_rmsnorm"]),
+            arch=str(cfg.get("arch", "factorized")),
+            split_tok_dim=int(cfg.get("split_tok_dim", 3)),
+            split_pos_dim=int(cfg.get("split_pos_dim", 3)),
+            split_n_head=int(cfg.get("split_n_head", 2)),
+            split_head_dim=int(cfg.get("split_head_dim", 3)),
+            split_tie_qk=_as_bool(cfg.get("split_tie_qk", False)),
+            split_ffn_bias=_as_bool(cfg.get("split_ffn_bias", True)),
+            split_spiral_init=_as_bool(cfg.get("split_spiral_init", True)),
+            prompt_order=str(cfg.get("prompt_order", "msd")),
         )
 
         try:
-            probe = TinyAdderTransformer(model_cfg)
+            probe = build_transformer(model_cfg)
         except ValueError as exc:
             run.summary["skipped"] = True
             run.summary["skip_reason"] = f"invalid_config: {exc}"
@@ -1034,7 +1319,7 @@ def run_sweep(project: str, entity: str, group: str, device: str, output_root: P
 # AdderBoard hooks
 # ----------------------------
 class SubmissionBundle:
-    def __init__(self, model: TinyAdderTransformer, device: torch.device):
+    def __init__(self, model: nn.Module, device: torch.device):
         self.model = model
         self.device = device
 
@@ -1043,7 +1328,7 @@ def build_model():
     ckpt = Path(os.environ.get("ADDER_CKPT", "best.pt"))
     device = torch.device(os.environ.get("ADDER_DEVICE", "cpu"))
     if not ckpt.exists():
-        model = TinyAdderTransformer(ModelConfig()).to(device)
+        model = build_transformer(ModelConfig()).to(device)
         metadata = {
             "name": "tiny-adder-lab",
             "author": "your-name",
@@ -1055,27 +1340,46 @@ def build_model():
 
     model, blob = load_checkpoint(ckpt, device)
     cfg = ModelConfig(**blob["model_config"])
+    if cfg.arch == "split":
+        arch_desc = (
+            f"{cfg.n_layer}L split decoder d={cfg.d_model} tok={cfg.split_tok_dim} "
+            f"pos={cfg.split_pos_dim} heads={cfg.split_n_head} hd={cfg.split_head_dim} ff={cfg.d_ff}"
+        )
+        tricks = [
+            "split token/position subspaces",
+            "QK from position, V from token",
+            "tied output via token embedding",
+            f"prompt_order={cfg.prompt_order}",
+            "autoregressive decoding",
+        ]
+    else:
+        arch_desc = (
+            f"{cfg.n_layer}L factorized decoder d={cfg.d_model} h={cfg.n_head} ff={cfg.d_ff} "
+            f"ranks=({cfg.pos_rank},{cfg.qkv_rank},{cfg.attn_out_rank},{cfg.ffn_rank})"
+        )
+        tricks = [
+            "tied token/output embedding",
+            "low-rank factorization",
+            f"qkv_tie={cfg.tie_qkv}",
+            f"prompt_order={cfg.prompt_order}",
+            "autoregressive decoding",
+        ]
     metadata = {
         "name": "tiny-adder-lab",
         "author": "your-name",
         "params": int(blob.get("params", unique_parameter_count(model))),
-        "architecture": (
-            f"{cfg.n_layer}L decoder d={cfg.d_model} h={cfg.n_head} ff={cfg.d_ff} "
-            f"ranks=({cfg.pos_rank},{cfg.qkv_rank},{cfg.attn_out_rank},{cfg.ffn_rank})"
-        ),
-        "tricks": [
-            "tied token/output embedding",
-            "low-rank factorization",
-            f"qkv_tie={cfg.tie_qkv}",
-            "autoregressive decoding",
-        ],
+        "architecture": arch_desc,
+        "tricks": tricks,
     }
     return SubmissionBundle(model, device), metadata
 
 
 @torch.no_grad()
 def add(bundle: SubmissionBundle, a: int, b: int) -> int:
-    prompt = torch.tensor([preprocess_prompt(a, b)], dtype=torch.long, device=bundle.device)
+    cfg = getattr(bundle.model, "cfg", ModelConfig())
+    prompt = torch.tensor(
+        [preprocess_prompt(a, b, prompt_order=cfg.prompt_order)], dtype=torch.long, device=bundle.device
+    )
     gen = bundle.model.generate(prompt, max_new_tokens=TARGET_LEN)
     return decode_generated_sum(gen[0, -TARGET_LEN:].tolist())
 
@@ -1114,6 +1418,7 @@ def parse_args() -> argparse.Namespace:
     t.add_argument("--d-model", type=int, default=4)
     t.add_argument("--n-head", type=int, default=1)
     t.add_argument("--d-ff", type=int, default=8)
+    t.add_argument("--arch", type=str, default="factorized", choices=["factorized", "split"])
     t.add_argument("--pe-kind", type=str, default="learned", choices=["learned", "rope", "sincos"])
     t.add_argument("--pe-period", type=float, default=11.0)
     t.add_argument("--pos-rank", type=int, default=3)
@@ -1123,6 +1428,16 @@ def parse_args() -> argparse.Namespace:
     t.add_argument("--tie-qkv", type=str, default="shareA_tieKV", choices=["none", "shareA_tieKV"])
     t.add_argument("--use-rmsnorm", action="store_true", default=True)
     t.add_argument("--no-rmsnorm", action="store_false", dest="use_rmsnorm")
+    t.add_argument("--split-tok-dim", type=int, default=3)
+    t.add_argument("--split-pos-dim", type=int, default=3)
+    t.add_argument("--split-n-head", type=int, default=2)
+    t.add_argument("--split-head-dim", type=int, default=3)
+    t.add_argument("--split-tie-qk", action="store_true", default=False)
+    t.add_argument("--split-ffn-bias", action="store_true", default=True)
+    t.add_argument("--split-no-ffn-bias", action="store_false", dest="split_ffn_bias")
+    t.add_argument("--split-spiral-init", action="store_true", default=True)
+    t.add_argument("--split-no-spiral-init", action="store_false", dest="split_spiral_init")
+    t.add_argument("--prompt-order", type=str, default="msd", choices=["msd", "lsd"])
 
     t.add_argument("--wandb", action="store_true", default=False)
     t.add_argument("--project", type=str, default="tiny-adder-lab")
@@ -1172,6 +1487,15 @@ def main() -> None:
             ffn_rank=args.ffn_rank,
             tie_qkv=args.tie_qkv,
             use_rmsnorm=args.use_rmsnorm,
+            arch=args.arch,
+            split_tok_dim=args.split_tok_dim,
+            split_pos_dim=args.split_pos_dim,
+            split_n_head=args.split_n_head,
+            split_head_dim=args.split_head_dim,
+            split_tie_qk=args.split_tie_qk,
+            split_ffn_bias=args.split_ffn_bias,
+            split_spiral_init=args.split_spiral_init,
+            prompt_order=args.prompt_order,
         )
         train_cfg = TrainConfig(
             seed=args.seed,
