@@ -94,8 +94,7 @@ parameters:
     values: [240]
 
 command:
-  - ${env}
-  - ${interpreter}
+  - .venv/bin/python
   - ${program}
   - sweep
   - --project
