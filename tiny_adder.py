@@ -224,6 +224,7 @@ class ModelConfig:
     split_tie_qk: bool = False
     split_ffn_bias: bool = True
     split_spiral_init: bool = True
+    split_pos_kind: str = "learned_shared"  # learned_shared, fixed_shared_sincos
     prompt_order: str = "msd"  # msd, lsd
 
 
@@ -422,18 +423,46 @@ class TinyAdderTransformer(nn.Module):
 class SplitPositionalEmbedding(nn.Module):
     """Shared XYZ positional table for fixed prompt/result layout."""
 
-    def __init__(self, max_seq_len: int, pos_dim: int):
+    def __init__(self, max_seq_len: int, pos_dim: int, kind: str = "learned_shared", period: float = 11.0):
         super().__init__()
         if pos_dim <= 0:
             raise ValueError(f"split_pos_dim must be > 0, got {pos_dim}")
         self.pos_dim = pos_dim
-        self.digit_pos = nn.Parameter(torch.empty(NUM_DIGITS, pos_dim))
-        self.carry_pos = nn.Parameter(torch.empty(1, pos_dim))
-        # +, =, fallback
-        self.special_pos = nn.Parameter(torch.empty(3, pos_dim))
-        nn.init.normal_(self.digit_pos, mean=0.0, std=0.02)
-        nn.init.normal_(self.carry_pos, mean=0.0, std=0.02)
-        nn.init.normal_(self.special_pos, mean=0.0, std=0.02)
+        self.kind = kind
+        if self.kind not in {"learned_shared", "fixed_shared_sincos"}:
+            raise ValueError(f"Unsupported split_pos_kind: {self.kind!r}")
+
+        if self.kind == "learned_shared":
+            self.digit_pos = nn.Parameter(torch.empty(NUM_DIGITS, pos_dim))
+            self.carry_pos = nn.Parameter(torch.empty(1, pos_dim))
+            # +, =, fallback
+            self.special_pos = nn.Parameter(torch.empty(3, pos_dim))
+            nn.init.normal_(self.digit_pos, mean=0.0, std=0.02)
+            nn.init.normal_(self.carry_pos, mean=0.0, std=0.02)
+            nn.init.normal_(self.special_pos, mean=0.0, std=0.02)
+        else:
+            if period <= 0:
+                raise ValueError(f"split fixed positional period must be > 0, got {period}")
+            digit_pos = torch.zeros(NUM_DIGITS, pos_dim, dtype=torch.float32)
+            for i in range(NUM_DIGITS):
+                if pos_dim >= 1:
+                    digit_pos[i, 0] = math.cos(2.0 * math.pi * i / period)
+                if pos_dim >= 2:
+                    digit_pos[i, 1] = math.sin(2.0 * math.pi * i / period)
+                if pos_dim >= 3:
+                    digit_pos[i, 2] = i / 9.0
+            carry_pos = torch.zeros(1, pos_dim, dtype=torch.float32)
+            special_pos = torch.zeros(3, pos_dim, dtype=torch.float32)
+            if pos_dim >= 1:
+                special_pos[0, 0] = 2.0  # '+'
+                special_pos[2, 0] = -2.0  # fallback
+            if pos_dim >= 2:
+                special_pos[1, 1] = 2.0  # '='
+            if pos_dim >= 3:
+                carry_pos[0, 2] = 1.5
+            self.register_buffer("digit_pos_fixed", digit_pos, persistent=False)
+            self.register_buffer("carry_pos_fixed", carry_pos, persistent=False)
+            self.register_buffer("special_pos_fixed", special_pos, persistent=False)
 
         sources = []
         indices = []
@@ -467,16 +496,24 @@ class SplitPositionalEmbedding(nn.Module):
     def forward(self, seqlen: int) -> torch.Tensor:
         src = self.sources[:seqlen]
         idx = self.indices[:seqlen]
-        out = torch.zeros(seqlen, self.pos_dim, device=self.digit_pos.device, dtype=self.digit_pos.dtype)
+        if self.kind == "learned_shared":
+            digit_pos = self.digit_pos
+            carry_pos = self.carry_pos
+            special_pos = self.special_pos
+        else:
+            digit_pos = self.digit_pos_fixed
+            carry_pos = self.carry_pos_fixed
+            special_pos = self.special_pos_fixed
+        out = torch.zeros(seqlen, self.pos_dim, device=digit_pos.device, dtype=digit_pos.dtype)
         mask_digit = src == 0
         if mask_digit.any():
-            out[mask_digit] = self.digit_pos[idx[mask_digit]]
+            out[mask_digit] = digit_pos[idx[mask_digit]]
         mask_carry = src == 1
         if mask_carry.any():
-            out[mask_carry] = self.carry_pos[idx[mask_carry]]
+            out[mask_carry] = carry_pos[idx[mask_carry]]
         mask_special = src == 2
         if mask_special.any():
-            out[mask_special] = self.special_pos[idx[mask_special]]
+            out[mask_special] = special_pos[idx[mask_special]]
         return out
 
 
@@ -564,7 +601,9 @@ class SplitTinyAdderTransformer(nn.Module):
             )
         self.cfg = cfg
         self.token_emb = nn.Embedding(cfg.vocab_size, cfg.split_tok_dim)
-        self.pos_emb = SplitPositionalEmbedding(cfg.max_seq_len, cfg.split_pos_dim)
+        self.pos_emb = SplitPositionalEmbedding(
+            cfg.max_seq_len, cfg.split_pos_dim, kind=cfg.split_pos_kind, period=cfg.pe_period
+        )
         self.blocks = nn.ModuleList([SplitBlock(cfg) for _ in range(cfg.n_layer)])
         norm_cls = RMSNorm if cfg.use_rmsnorm else nn.LayerNorm
         self.ln_f = norm_cls(cfg.d_model)
@@ -1210,6 +1249,7 @@ def run_sweep(project: str, entity: str, group: str, device: str, output_root: P
         "split_tie_qk": False,
         "split_ffn_bias": True,
         "split_spiral_init": True,
+        "split_pos_kind": "learned_shared",
         "prompt_order": "msd",
         "steps": 162000,
         "batch_size": 512,
@@ -1262,6 +1302,7 @@ def run_sweep(project: str, entity: str, group: str, device: str, output_root: P
             split_tie_qk=_as_bool(cfg.get("split_tie_qk", False)),
             split_ffn_bias=_as_bool(cfg.get("split_ffn_bias", True)),
             split_spiral_init=_as_bool(cfg.get("split_spiral_init", True)),
+            split_pos_kind=str(cfg.get("split_pos_kind", "learned_shared")),
             prompt_order=str(cfg.get("prompt_order", "msd")),
         )
 
@@ -1349,6 +1390,7 @@ def build_model():
             "split token/position subspaces",
             "QK from position, V from token",
             "tied output via token embedding",
+            f"split_pos_kind={cfg.split_pos_kind}",
             f"prompt_order={cfg.prompt_order}",
             "autoregressive decoding",
         ]
@@ -1437,6 +1479,12 @@ def parse_args() -> argparse.Namespace:
     t.add_argument("--split-no-ffn-bias", action="store_false", dest="split_ffn_bias")
     t.add_argument("--split-spiral-init", action="store_true", default=True)
     t.add_argument("--split-no-spiral-init", action="store_false", dest="split_spiral_init")
+    t.add_argument(
+        "--split-pos-kind",
+        type=str,
+        default="learned_shared",
+        choices=["learned_shared", "fixed_shared_sincos"],
+    )
     t.add_argument("--prompt-order", type=str, default="msd", choices=["msd", "lsd"])
 
     t.add_argument("--wandb", action="store_true", default=False)
@@ -1495,6 +1543,7 @@ def main() -> None:
             split_tie_qk=args.split_tie_qk,
             split_ffn_bias=args.split_ffn_bias,
             split_spiral_init=args.split_spiral_init,
+            split_pos_kind=args.split_pos_kind,
             prompt_order=args.prompt_order,
         )
         train_cfg = TrainConfig(
