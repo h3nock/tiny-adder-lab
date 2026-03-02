@@ -1,8 +1,8 @@
 program: tiny_adder.py
-name: tiny-adder-sub512-search
+name: tiny-adder-split-sub300-search
 method: bayes
 metric:
-  name: best_val_token_acc
+  name: best_val_exact
   goal: maximize
 early_terminate:
   type: hyperband
@@ -11,26 +11,53 @@ early_terminate:
 parameters:
   seed:
     values: [34, 42, 43, 44]
+
+  arch:
+    values: ["split"]
   n_layer:
     values: [1]
   d_model:
-    values: [4, 5, 6, 7]
-  n_head:
-    values: [1]
+    values: [6]
   d_ff:
-    values: [8, 10, 12, 14]
-  tie_qkv:
-    values: ["shareA_tieKV"]
+    values: [1, 2]
   use_rmsnorm:
     values: [true]
+
+  split_tok_dim:
+    values: [3]
+  split_pos_dim:
+    values: [3]
+  split_n_head:
+    values: [2]
+  split_head_dim:
+    values: [3]
+  split_tie_qk:
+    values: [false, true]
+  split_ffn_bias:
+    values: [true]
+  split_spiral_init:
+    values: [true]
+  prompt_order:
+    values: ["lsd"]
+
+  # Kept fixed for compatibility with existing config parser; unused in split arch.
+  n_head:
+    values: [1]
+  pe_kind:
+    values: ["learned"]
+  pe_period:
+    values: [11.0]
   pos_rank:
-    values: [2, 3]
+    values: [3]
   qkv_rank:
-    values: [2, 3]
+    values: [3]
   attn_out_rank:
-    values: [2, 3]
+    values: [3]
   ffn_rank:
-    values: [2, 3]
+    values: [3]
+  tie_qkv:
+    values: ["shareA_tieKV"]
+
   curriculum_mode:
     values: ["absolute"]
   phase1_end:
@@ -43,14 +70,14 @@ parameters:
     values: [512]
   lr:
     distribution: log_uniform_values
-    min: 0.015
-    max: 0.024
+    min: 0.003
+    max: 0.008
   min_lr_ratio:
-    values: [0.08, 0.1]
+    values: [0.1]
   warmup_steps:
     values: [2000]
   weight_decay:
-    values: [0.003, 0.01]
+    values: [0.01, 0.02]
   grad_clip:
     values: [1.0]
   eval_interval:
@@ -64,20 +91,19 @@ parameters:
   holdout_seed:
     values: [2025]
   max_params:
-    values: [512]
+    values: [240]
 
 command:
-  - ${env}
-  - ${interpreter}
+  - .venv/bin/python
   - ${program}
   - sweep
   - --project
   - tiny-adder-lab
   - --group
-  - sub512-search
+  - split-sub300-search
   - --device
   - cuda
   - --output-root
   - runs/wandb
   - --tags
-  - tiny,adder,sub512,search
+  - tiny,adder,split,sub300
