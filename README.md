@@ -1,8 +1,8 @@
 # tiny-adder-lab
 
-Small PyTorch repo for 10-digit addition with a tiny autoregressive transformer.
+Minimal PyTorch repo for tiny autoregressive transformers that perform 10-digit addition.
 
-## Setup
+## Install
 ```bash
 pip install torch wandb
 ```
@@ -23,48 +23,47 @@ Predict:
 python tiny_adder.py predict --ckpt best.pt --device cuda --a 1234567890 --b 9876543210
 ```
 
-## W&B Sweep
-```bash
-wandb sweep sweep.yaml
-wandb agent <entity>/<project>/<sweep_id>
-```
+## 239-Parameter Frontier Result
+This result came from branch `exp/split-frontier-explore` and sweep `tiny-adder-split-frontier` (`r11xj7pr`).
 
-Use `sweep.yaml` for main search and `sweep_pe.yaml` for PE-focused search.
+Reference runs:
+- `blooming-sweep-4` ([w0yxzaqp](https://wandb.ai/henokwondimu/tiny-adder-lab/runs/w0yxzaqp)): `params=239`, `best_val_exact=1.0`, `test_exact=0.9999`
+- `sandy-sweep-14` ([zw3h3adk](https://wandb.ai/henokwondimu/tiny-adder-lab/runs/zw3h3adk)): `params=239`, `best_val_exact=1.0`, `test_exact=1.0`
 
-## 305-Parameter Reference Run
-Run: https://wandb.ai/henokwondimu/tiny-adder-lab/runs/l6voiqpn
-
-- params: `305`
-- best_step: `386000`
-- best_val_exact: `1.0`
-- best_val_token_acc: `1.0`
-- test_exact: `0.9998`
-- test_token_acc: `0.9999818`
-
-This run trained for `512000` steps.
-
-Reproduce:
+Reproduce `blooming-sweep-4` config:
 ```bash
 python tiny_adder.py train \
   --device cuda \
-  --seed 43 \
-  --n-layer 1 --d-model 4 --n-head 1 --d-ff 9 \
-  --pe-kind learned --pos-rank 3 \
-  --qkv-rank 3 --attn-out-rank 2 --ffn-rank 3 \
-  --tie-qkv shareA_tieKV --use-rmsnorm \
+  --seed 34 \
+  --arch split \
+  --n-layer 1 --d-model 6 --d-ff 2 \
+  --split-tok-dim 3 --split-pos-dim 3 \
+  --split-n-head 2 --split-head-dim 3 \
+  --split-ffn-bias --split-spiral-init \
+  --split-pos-kind learned_shared \
+  --prompt-order lsd \
+  --use-rmsnorm \
   --batch-size 512 --steps 512000 \
-  --lr 0.01808611797410989 --min-lr-ratio 0.1 \
-  --warmup-steps 2000 --weight-decay 0.003 --grad-clip 1 \
+  --lr 0.004080483478864221 \
+  --min-lr-ratio 0.1 --warmup-steps 2000 \
+  --weight-decay 0.01 --grad-clip 1 \
   --curriculum-mode absolute --phase1-end 2000 --phase2-end 7000 \
   --eval-interval 2000 --eval-batch-size 512 \
   --val-size 5000 --test-size 10000 --holdout-seed 2025 \
-  --ckpt-out runs/wandb/l6voiqpn/best.pt \
-  --last-ckpt-out runs/wandb/l6voiqpn/last.pt
+  --ckpt-out runs/wandb/w0yxzaqp/best.pt \
+  --last-ckpt-out runs/wandb/w0yxzaqp/last.pt
 ```
 
-## AdderBoard verify integration
+## AdderBoard Verify
 `tiny_adder.py` exposes `build_model()` and `add(model, a, b)`.
 
 ```bash
-ADDER_CKPT=best.pt python verify.py tiny_adder.py --seed 2025
+ADDER_CKPT=runs/wandb/zw3h3adk/best.pt ADDER_DEVICE=cuda python verify.py tiny_adder.py --seed 2025
 ```
+
+Expected verify headline for `zw3h3adk`: `10010/10010 correct (100.00%)`.
+
+## Sweep Files
+- `sweep.yaml`: broad factorized search (sub-334)
+- `sweep_split.yaml`: split-architecture frontier search
+- `sweep_split_sub200.yaml`: sub-200 follow-up search
