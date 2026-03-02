@@ -1,5 +1,5 @@
 program: tiny_adder.py
-name: tiny-adder-split-frontier
+name: tiny-adder-split-sub300-search
 method: bayes
 metric:
   name: best_val_exact
@@ -100,10 +100,10 @@ command:
   - --project
   - tiny-adder-lab
   - --group
-  - split-frontier
+  - split-sub300-search
   - --device
   - cuda
   - --output-root
   - runs/wandb
   - --tags
-  - tiny,adder,split,frontier,sub242
+  - tiny,adder,split,sub300

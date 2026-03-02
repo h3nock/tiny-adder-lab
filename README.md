@@ -23,14 +23,9 @@ Predict:
 python tiny_adder.py predict --ckpt best.pt --device cuda --a 1234567890 --b 9876543210
 ```
 
-## 239-Parameter Frontier Result
-This result came from branch `exp/split-frontier-explore` and sweep `tiny-adder-split-frontier` (`r11xj7pr`).
+## 239-Parameter Result (From Sub-300 Search)
+This configuration came from a sub-300 search, where one run reached 239 parameters with perfect validation exact match.
 
-Reference runs:
-- `blooming-sweep-4` ([w0yxzaqp](https://wandb.ai/henokwondimu/tiny-adder-lab/runs/w0yxzaqp)): `params=239`, `best_val_exact=1.0`, `test_exact=0.9999`
-- `sandy-sweep-14` ([zw3h3adk](https://wandb.ai/henokwondimu/tiny-adder-lab/runs/zw3h3adk)): `params=239`, `best_val_exact=1.0`, `test_exact=1.0`
-
-Reproduce `blooming-sweep-4` config:
 ```bash
 python tiny_adder.py train \
   --device cuda \
@@ -44,26 +39,21 @@ python tiny_adder.py train \
   --prompt-order lsd \
   --use-rmsnorm \
   --batch-size 512 --steps 512000 \
-  --lr 0.004080483478864221 \
+  --lr 0.00408 \
   --min-lr-ratio 0.1 --warmup-steps 2000 \
   --weight-decay 0.01 --grad-clip 1 \
   --curriculum-mode absolute --phase1-end 2000 --phase2-end 7000 \
   --eval-interval 2000 --eval-batch-size 512 \
   --val-size 5000 --test-size 10000 --holdout-seed 2025 \
-  --ckpt-out runs/wandb/w0yxzaqp/best.pt \
-  --last-ckpt-out runs/wandb/w0yxzaqp/last.pt
+  --ckpt-out best_239.pt --last-ckpt-out last_239.pt
 ```
 
 ## AdderBoard Verify
 `tiny_adder.py` exposes `build_model()` and `add(model, a, b)`.
 
 ```bash
-ADDER_CKPT=runs/wandb/zw3h3adk/best.pt ADDER_DEVICE=cuda python verify.py tiny_adder.py --seed 2025
+ADDER_CKPT=best_239.pt ADDER_DEVICE=cuda python verify.py tiny_adder.py --seed 2025
 ```
 
-Expected verify headline for `zw3h3adk`: `10010/10010 correct (100.00%)`.
-
 ## Sweep Files
-- `sweep.yaml`: broad factorized search (sub-334)
-- `sweep_split.yaml`: split-architecture frontier search
-- `sweep_split_sub200.yaml`: sub-200 follow-up search
+- `sweep_split.yaml`: split sub-300 search that produced the 239-parameter result
