@@ -49,6 +49,8 @@ python tiny_adder.py train \
 ```
 
 ## AdderBoard Verify
+Benchmark: [AdderBoard](https://github.com/anadim/AdderBoard)
+
 `tiny_adder.py` exposes `build_model()` and `add(model, a, b)`.
 
 ```bash
